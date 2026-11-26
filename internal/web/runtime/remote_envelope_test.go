@@ -1,0 +1,201 @@
+package runtime
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/wirecodec"
+)
+
+// TestRemoteSendsEnvelopeWhenNodeAdvertisesCap: once a node has advertised the
+// zstd capability (via a response header on any prior call), a large push is
+// sent zstd-compressed with an X-Config-Sha256 of the *uncompressed* body.
+func TestRemoteSendsEnvelopeWhenNodeAdvertisesCap(t *testing.T) {
+	var capturedEnc, capturedHash string
+	var capturedBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(wirecodec.CapsHeader, wirecodec.CapZstd) // advertise on every response
+		if r.Method == http.MethodPost {
+			capturedEnc = r.Header.Get("Content-Encoding")
+			capturedHash = r.Header.Get(wirecodec.HashHeader)
+			capturedBody, _ = io.ReadAll(r.Body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+
+	r := NewRemote(nodeForPlainServer(t, srv, "verify", "tok"), nil)
+
+	// Prime: a prior call learns the cap from the response header.
+	if _, err := r.do(context.Background(), http.MethodGet, "ping", nil); err != nil {
+		t.Fatalf("prime call: %v", err)
+	}
+
+	body := url.Values{}
+	body.Set("settings", strings.Repeat("x", 4096))
+	if _, err := r.do(context.Background(), http.MethodPost, "panel/api/inbounds/add", body); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	if capturedEnc != wirecodec.EncodingZstd {
+		t.Fatalf("Content-Encoding = %q, want %q", capturedEnc, wirecodec.EncodingZstd)
+	}
+	if len(capturedHash) != 64 {
+		t.Fatalf("missing/short X-Config-Sha256: %q", capturedHash)
+	}
+	raw, err := wirecodec.Decompress(capturedBody, 1<<20)
+	if err != nil {
+		t.Fatalf("server could not decompress the body: %v", err)
+	}
+	if string(raw) != body.Encode() {
+		t.Fatalf("decompressed body mismatch: %q != %q", string(raw), body.Encode())
+	}
+	if wirecodec.Sha256Hex(raw) != capturedHash {
+		t.Fatal("X-Config-Sha256 does not match the decompressed body")
+	}
+}
+
+// TestRemoteSendsPlainWhenNoCap: a node that never advertises the cap (old
+// build) receives a plain body — but the integrity hash is still attached
+// (harmless to old nodes, verified by new ones).
+func TestRemoteSendsPlainWhenNoCap(t *testing.T) {
+	var capturedEnc, capturedHash string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			capturedEnc = r.Header.Get("Content-Encoding")
+			capturedHash = r.Header.Get(wirecodec.HashHeader)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true}`))
+	}))
+	defer srv.Close()
+
+	r := NewRemote(nodeForPlainServer(t, srv, "verify", "tok"), nil)
+	body := url.Values{}
+	body.Set("settings", strings.Repeat("x", 4096))
+	if _, err := r.do(context.Background(), http.MethodPost, "panel/api/inbounds/add", body); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	if capturedEnc != "" {
+		t.Fatalf("a no-cap node must receive a plain body, got Content-Encoding=%q", capturedEnc)
+	}
+	if len(capturedHash) != 64 {
+		t.Fatalf("integrity hash should always be sent, got %q", capturedHash)
+	}
+}
+
+func TestRemoteRequiresSupportForInboundOnlyScheduledReset(t *testing.T) {
+	for _, caps := range []string{wirecodec.CapZstd, wirecodec.NodeCaps} {
+		t.Run(caps, func(t *testing.T) {
+			var pushed bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(wirecodec.CapsHeader, caps)
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodPost {
+					pushed = true
+				}
+				_, _ = w.Write([]byte(`{"success":true,"obj":[]}`))
+			}))
+			defer srv.Close()
+
+			r := NewRemote(nodeForPlainServer(t, srv, "verify", "tok"), nil)
+			ib := &model.Inbound{TrafficReset: "monthly", PreserveClientTraffic: new(true)}
+			err := r.AddInbound(context.Background(), ib)
+			if caps == wirecodec.NodeCaps {
+				if err != nil || !pushed {
+					t.Fatalf("capable node: pushed = %v, error = %v", pushed, err)
+				}
+			} else if pushed || err == nil || !strings.Contains(err.Error(), "does not support inbound-only scheduled traffic resets") {
+				t.Fatalf("older node: pushed = %v, error = %v", pushed, err)
+			}
+		})
+	}
+}
+
+// An older node ignores wireguardDevices and serves only each client's first peer, so
+// the master must not push device configs that node would never back.
+func TestRemoteRequiresSupportForWireguardDevices(t *testing.T) {
+	const older = wirecodec.CapZstd + "," + wirecodec.CapAmneziaWGKernel + "," + wirecodec.CapPreserveClientTraffic
+	const withDevices = `{"clients":[{"email":"a","wireguardDevices":[{"id":"d1"}]}]}`
+	cases := []struct {
+		name, caps, settings string
+		wantPushed           bool
+	}{
+		{"capable node", wirecodec.NodeCaps, withDevices, true},
+		{"older node, client with devices", older, withDevices, false},
+		{"older node, no devices", older, `{"clients":[{"email":"a","wireguardDevices":[]}]}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var pushed bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(wirecodec.CapsHeader, tc.caps)
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodPost {
+					pushed = true
+				}
+				_, _ = w.Write([]byte(`{"success":true,"obj":[]}`))
+			}))
+			defer srv.Close()
+
+			r := NewRemote(nodeForPlainServer(t, srv, "verify", "tok"), nil)
+			err := r.AddInbound(context.Background(), &model.Inbound{Protocol: model.WireGuard, Settings: tc.settings})
+			if tc.wantPushed {
+				if err != nil || !pushed {
+					t.Fatalf("pushed = %v, error = %v", pushed, err)
+				}
+			} else if pushed || err == nil || !strings.Contains(err.Error(), "does not support WireGuard client devices") {
+				t.Fatalf("pushed = %v, error = %v", pushed, err)
+			}
+		})
+	}
+}
+
+// TestRemoteRefusesKernelAmneziaWGOnNodeWithoutCap: an older node drops the
+// kernelMode flag and silently runs the inbound on the embedded datapath.
+func TestRemoteRefusesKernelAmneziaWGOnNodeWithoutCap(t *testing.T) {
+	cases := []struct {
+		name       string
+		caps       string
+		kernel     bool
+		wantRefuse bool
+	}{
+		{"old node, kernel inbound", wirecodec.CapZstd, true, true},
+		{"node without any caps, kernel inbound", "", true, true},
+		{"kernel-capable node, kernel inbound", wirecodec.NodeCaps, true, false},
+		{"old node, embedded inbound", wirecodec.CapZstd, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var pushed bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.caps != "" {
+					w.Header().Set(wirecodec.CapsHeader, tc.caps)
+				}
+				if r.Method == http.MethodPost {
+					pushed = true
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"success":true,"obj":[]}`))
+			}))
+			defer srv.Close()
+
+			r := NewRemote(nodeForPlainServer(t, srv, "verify", "tok"), nil)
+			err := r.AddInbound(context.Background(), datapathInbound(t, 1, 51820, tc.kernel))
+			if refused := err != nil && strings.Contains(err.Error(), "does not support AmneziaWG kernel mode"); refused != tc.wantRefuse {
+				t.Fatalf("refused = %v (err %v), want %v", refused, err, tc.wantRefuse)
+			}
+			if pushed == tc.wantRefuse {
+				t.Fatalf("inbound pushed = %v, want %v", pushed, !tc.wantRefuse)
+			}
+		})
+	}
+}
